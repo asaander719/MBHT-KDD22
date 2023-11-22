@@ -16,6 +16,9 @@ def get_args():
     parser.add_argument('--valid_portion', type=float, default=0.1, help='ratio of validation set.')
     parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--batch_size', type=int, default=2048)
+    parser.add_argument('--enable_hg', type=int, default=1)
+    parser.add_argument('--enable_ms', type=int, default=1)
+    parser.add_argument('--customized_eval', type=int, default=1)
     return parser.parse_known_args()[0]
 
 
@@ -39,13 +42,13 @@ if __name__ == '__main__':
             },
         'gpu_id':args.gpu_id,
         "MAX_ITEM_LIST_LENGTH":200,
-        "train_batch_size": 32 if args.dataset == "ijcai_beh" else 64,
+        "train_batch_size": 24 if args.dataset == "ijcai_beh" else 64, #36
         "eval_batch_size":24 if args.dataset == "ijcai_beh" else 128,
         "hyper_len":10 if args.dataset == "ijcai_beh" else 6,
         "scales":[10, 4, 20],
-        "enable_hg":1,
-        "enable_ms":1,
-        "customized_eval":1,
+        "enable_hg":1,  # 1,
+        "enable_ms":1,  # 1,
+        "customized_eval":1,  # 1,
         "abaltion":""
     }
 

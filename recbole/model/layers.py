@@ -34,7 +34,7 @@ class HGNN(nn.Module):
         self.dropout = dropout
         self.hgc1 = HGNN_conv(n_hid, n_hid)
         self.hgc2 = HGNN_conv(n_hid, n_hid)
-        self.out_fc = nn.Linear(n_hid, n_hid)
+        # self.out_fc = nn.Linear(n_hid, n_hid)
 
     def forward(self, x, G):
         x1 = self.hgc1(x, G)
@@ -44,7 +44,7 @@ class HGNN(nn.Module):
         # x2 = F.relu(x2)
         x2 = F.dropout(x2, self.dropout, training=self.training)
         return ((x1+x2)/2)
-        return self.out_fc((x1+x2)/2)
+        # return self.out_fc((x1+x2)/2)
 
 class HGNN_conv(nn.Module):
     def __init__(self, n_hid, bias=True):

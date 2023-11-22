@@ -53,6 +53,9 @@ class MBHT(SequentialRecommender):
         self.type_embedding = nn.Embedding(6, self.hidden_size, padding_idx=0)
         self.item_embedding = nn.Embedding(self.n_items + 1, self.hidden_size, padding_idx=0)  # mask token add 1
         self.position_embedding = nn.Embedding(self.max_seq_length + 1, self.hidden_size)  # add mask_token at the last
+
+        self.en_model = Seq2Seq(input_dim=64, hidden_dim=self.hidden_size, output_dim=64, num_layers=1)
+
         if self.enable_ms:
             self.trm_encoder = TransformerEncoder(
                 n_layers=self.n_layers,
@@ -78,7 +81,8 @@ class MBHT(SequentialRecommender):
                 layer_norm_eps=self.layer_norm_eps,
                 multiscale=False
             )
-        self.hgnn_layer = HGNN(self.hidden_size)
+        self.hgnn_layer_en = HGNN(self.hidden_size)
+        self.hgnn_layer_de = HGNN(self.hidden_size)
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
 
@@ -137,10 +141,12 @@ class MBHT(SequentialRecommender):
         else:
             """Generate bidirectional attention mask for multi-head attention."""
             attention_mask = (item_seq > 0).long()
+            #The result is a tensor of 0s and 1s, where 1 indicates a valid item, and 0 indicates a padding or invalid item.
             extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # torch.int64
             # bidirectional mask
             extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
-            extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+            extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0 
+            #after softmax function, these positions will have zero weight in the attention mechanism.
             return extended_attention_mask
 
     def _padding_sequence(self, sequence, max_length):
@@ -194,7 +200,7 @@ class MBHT(SequentialRecommender):
                     masked_sequence[index_id] = self.mask_token
                     type_instances[instance_idx][index_id] = 0
                     index_ids.append(index_id)
-
+            #The list of masked items (pos_items) and their indices (masked_index) are padded to a fixed length (self.mask_item_length).
             masked_item_sequence.append(masked_sequence)
             pos_items.append(self._padding_sequence(pos_item, self.mask_item_length))
             masked_index.append(self._padding_sequence(index_ids, self.mask_item_length))
@@ -203,7 +209,8 @@ class MBHT(SequentialRecommender):
         masked_item_sequence = torch.tensor(masked_item_sequence, dtype=torch.long, device=device).view(batch_size, -1)
         # [B mask_len]
         pos_items = torch.tensor(pos_items, dtype=torch.long, device=device).view(batch_size, -1)
-        # [B mask_len]
+        #pos_items.size() = torch.Size([64, 40])
+        # [B mask_len] #[[ 0,     0,     0,  ...,     0, 16308,  1998],[    0,     0,     0,  ...,  7592,  3486,  8531]]
         masked_index = torch.tensor(masked_index, dtype=torch.long, device=device).view(batch_size, -1)
         type_instances = torch.tensor(type_instances, dtype=torch.long, device=device).view(batch_size, -1)
         return masked_item_sequence, pos_items, masked_index, type_instances
@@ -227,20 +234,21 @@ class MBHT(SequentialRecommender):
         item_emb = self.item_embedding(item_seq)
         input_emb = item_emb + position_embedding + type_embedding
         input_emb = self.LayerNorm(input_emb)
-        input_emb = self.dropout(input_emb)
-        extended_attention_mask = self.get_attention_mask(item_seq)
+        input_emb = self.dropout(input_emb)  # torch.Size([128, 200, 64])
+        extended_attention_mask = self.get_attention_mask(item_seq) #torch.Size([128, 1, 200])
         trm_output = self.trm_encoder(input_emb, extended_attention_mask, output_all_encoded_layers=True)
-        output = trm_output[-1]
+        output = trm_output[-1]  #torch.Size([128, 200, 64])
 
         if self.enable_hg:
-            x_raw = item_emb
-            x_raw = x_raw * torch.sigmoid(x_raw.matmul(self.gating_weight)+self.gating_bias)
+            x_raw = item_emb + type_embedding # x_raw = item_emb 
+            x_raw = x_raw * torch.sigmoid(x_raw.matmul(self.gating_weight)+self.gating_bias) # torch.Size([128, 200, 64]) #func. 12?
             # b, l, l
-            x_m = torch.stack((self.metric_w1*x_raw, self.metric_w2*x_raw)).mean(0)
+            x_m = torch.stack((self.metric_w1*x_raw, self.metric_w2*x_raw)).mean(0) # torch.Size([128, 200, 64])
             item_sim = sim(x_m, x_m)
-            item_sim[item_sim < 0] = 0.01
+            item_sim[item_sim < 0] = 0.01 # torch.Size([128, 200, 200])
 
-            Gs = self.build_Gs_unique(item_seq, item_sim, self.hglen)
+            Gs = self.build_Gs_unique(item_seq, item_sim, self.hglen) # item_seq.size() = torch.Size([128, 200]) fixed
+            # print(Gs.size()) torch.Size([579, 579])  torch.Size([631, 631])
             # Gs = self.build_Gs_light(item_seq, item_sim, self.hglen)
 
             batch_size = item_seq.shape[0]
@@ -252,7 +260,8 @@ class MBHT(SequentialRecommender):
                 # l', dim
                 indexed_embs.append(x_raw[batch_idx][:n_obj])
             indexed_embs = torch.cat(indexed_embs, dim=0)
-            hgnn_embs = self.hgnn_layer(indexed_embs, Gs)
+            hgnn_embs = self.hgnn_layer_en(indexed_embs, Gs) #torch.Size([696, 64]) torch.Size([631, 64])
+            
             hgnn_take_start = 0
             hgnn_embs_padded = []
             for batch_idx in range(batch_size):
@@ -287,7 +296,7 @@ class MBHT(SequentialRecommender):
             mixed_x = torch.stack((output, hgnn_embs), dim=0)
             weights = (torch.matmul(mixed_x, self.attn_weights.unsqueeze(0).unsqueeze(0))*self.attn).sum(-1)
             # 2, b, l, 1
-            score = F.softmax(weights, dim=0).unsqueeze(-1)
+            score = F.softmax(weights, dim=0).unsqueeze(-1)  # function 13
             mixed_x = (mixed_x*score).sum(0)
             # mixed_x = self.bert.forward_from_emb(tokens, beh_types, mixed_x)
             # b, s, n
@@ -299,7 +308,8 @@ class MBHT(SequentialRecommender):
             # attn_score_mask = score.squeeze().permute(1,2,0)
             # out_self_attn = torch.matmul(output, output.transpose(-2,-1)) / math.sqrt(output.size(-1))
             # out_self_attn = F.softmax(out_self_attn, -1)
-            return mixed_x
+            # return mixed_x
+            output = mixed_x #torch.Size([128, 200, 64])
         return output  # [B L H]
 
     def multi_hot_embed(self, masked_index, max_length):
@@ -313,16 +323,50 @@ class MBHT(SequentialRecommender):
 
             masked_sequence: [1 mask 3 mask 5]
 
-            masked_index: [1, 3]
+            masked_index: [1, 3]                 [[ 0,  0,  0,  ..., 44, 47, 49],...[ 0,  0,  0,  ...,  0,  0,  1]]
 
             max_length: 5
 
             multi_hot_embed: [[0 1 0 0 0], [0 0 0 1 0]]
         """
-        masked_index = masked_index.view(-1)
+        masked_index = masked_index.view(-1) #torch.Size([2560]) 
         multi_hot = torch.zeros(masked_index.size(0), max_length, device=masked_index.device)
         multi_hot[torch.arange(masked_index.size(0)), masked_index] = 1
-        return multi_hot
+        return multi_hot #torch.Size([2560, 200])
+
+    # def predict_target_emd(self, seq_output):
+    #     # masked_index = masked_index.view(-1)
+    #     #masked_target_p_emd = self.position_embedding(masked_index) #torch.Size([64, 40, 64])
+    #     #seq_output.size() = torch.Size([64, 200, 64])
+    #     dim = seq_output.size(-1)
+        
+    #     output = self.en_model(seq_output) #torch.Size([64, 200, 64])
+    #     return output
+
+    # def calculate_loss(self, interaction):
+    #     item_seq = interaction[self.ITEM_SEQ]
+    #     session_id = interaction['session_id']
+    #     item_type = interaction["item_type_list"]
+    #     last_buy = interaction["item_id"]
+    #     masked_item_seq, pos_items, masked_index, item_type_seq = self.reconstruct_train_data(item_seq, item_type, last_buy)
+
+    #     mask_nums = torch.count_nonzero(pos_items, dim=1)
+    #     seq_output = self.forward(masked_item_seq, item_type_seq, mask_positions_nums=(masked_index, mask_nums), session_id=session_id)
+    #     pred_index_map = self.multi_hot_embed(masked_index, masked_item_seq.size(-1))  # [B*mask_len max_len]
+    #     # [B mask_len] -> [B mask_len max_len] multi hot
+    #     pred_index_map = pred_index_map.view(masked_index.size(0), masked_index.size(1), -1)  # [B mask_len max_len]
+    #     # [B mask_len max_len] * [B max_len H] -> [B mask_len H]
+    #     # only calculate loss for masked position
+    #     seq_output = torch.bmm(pred_index_map, seq_output)  # [B mask_len H]
+
+    #     loss_fct = nn.CrossEntropyLoss(reduction='none')
+    #     test_item_emb = self.item_embedding.weight  # [item_num H]
+    #     logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))  # [B mask_len item_num]
+    #     targets = (masked_index > 0).float().view(-1)  # [B*mask_len]
+
+    #     loss = torch.sum(loss_fct(logits.view(-1, test_item_emb.size(0)), pos_items.view(-1)) * targets) \
+    #             / torch.sum(targets)
+    #     return loss
 
     def calculate_loss(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
@@ -333,11 +377,15 @@ class MBHT(SequentialRecommender):
 
         mask_nums = torch.count_nonzero(pos_items, dim=1)
         seq_output = self.forward(masked_item_seq, item_type_seq, mask_positions_nums=(masked_index, mask_nums), session_id=session_id)
+
         pred_index_map = self.multi_hot_embed(masked_index, masked_item_seq.size(-1))  # [B*mask_len max_len]
         # [B mask_len] -> [B mask_len max_len] multi hot
         pred_index_map = pred_index_map.view(masked_index.size(0), masked_index.size(1), -1)  # [B mask_len max_len]
         # [B mask_len max_len] * [B max_len H] -> [B mask_len H]
         # only calculate loss for masked position
+
+        seq_output_ed = self.en_model(seq_output)
+        seq_output_ed = torch.bmm(pred_index_map, seq_output_ed) 
         seq_output = torch.bmm(pred_index_map, seq_output)  # [B mask_len H]
 
         loss_fct = nn.CrossEntropyLoss(reduction='none')
@@ -347,7 +395,21 @@ class MBHT(SequentialRecommender):
 
         loss = torch.sum(loss_fct(logits.view(-1, test_item_emb.size(0)), pos_items.view(-1)) * targets) \
                 / torch.sum(targets)
-        return loss
+        
+        #pos_items.size()=torch.Size([64, 40])
+
+        logits_2 = torch.matmul(seq_output_ed, test_item_emb.transpose(0, 1)) 
+        loss_2 = torch.sum(loss_fct(logits_2.view(-1, test_item_emb.size(0)), pos_items.view(-1)) * targets) \
+                / torch.sum(targets)
+        
+        # output_distribution = F.log_softmax(seq_output_ed, dim=-1)
+        # target_distribution = F.softmax(pos_items.view(-1), dim=-1)
+        # kl_loss = F.kl_div(output_distribution, pos_items, reduction='batchmean')
+        # kl_loss =  torch.sum(F.kl_div(output_distribution, pos_items.view(-1), reduction='batchmean')* targets) \
+        #         / torch.sum(targets)
+
+        total_loss = 0.8 * loss + 0.2 * loss_2
+        return total_loss
 
     def full_sort_predict(self, interaction):
         item_seq = interaction['item_id_list']
@@ -380,7 +442,7 @@ class MBHT(SequentialRecommender):
                     while new_cand in seen:
                         new_cand = random.randint(1, self.n_items)
                     cands[i] = new_cand
-            cands.insert(0, truth[batch_idx].item())
+            cands.insert(0, truth[batch_idx].item()) 
             customized_candidates.append(cands)
         candidates = torch.LongTensor(customized_candidates).to(item_seq.device)
         item_seq_len = torch.count_nonzero(item_seq, 1)
@@ -391,10 +453,10 @@ class MBHT(SequentialRecommender):
         scores = torch.bmm(test_items_emb, seq_output.unsqueeze(-1)).squeeze()  # [B, item_num]
         return scores
 
-    def build_Gs_unique(self, seqs, item_sim, group_len):
-        Gs = []
+    def build_Gs_unique(self, seqs, item_sim, group_len): # item_seq.size() = torch.Size([128, 200]) fixed
+        Gs = []  # item_sim.size()= torch.Size([128, 200, 200])
         n_objs = torch.count_nonzero(seqs, dim=1).tolist()
-        for batch_idx in range(seqs.shape[0]):
+        for batch_idx in range(seqs.shape[0]): #128
             seq = seqs[batch_idx]
             n_obj = n_objs[batch_idx]
             seq = seq[:n_obj].cpu()
@@ -464,3 +526,38 @@ class MBHT(SequentialRecommender):
             Gs.append(G.to(seqs.device))
         Gs_block_diag = torch.block_diag(*Gs)
         return Gs_block_diag
+
+
+class Encoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers=1):
+        super(Encoder, self).__init__()
+        self.rnn = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+
+    def forward(self, x):
+        outputs, (hidden, cell) = self.rnn(x)
+        return hidden, cell
+
+class Decoder(nn.Module):
+    def __init__(self, output_dim, hidden_dim, num_layers=1, dropout=0.3):
+        super(Decoder, self).__init__()
+        self.rnn = nn.LSTM(output_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.dropout = dropout
+
+    def forward(self, x, hidden, cell):
+        output, (hidden, cell) = self.rnn(x, (hidden, cell))
+        prediction = self.fc(output)
+        prediction = F.dropout(prediction, self.dropout, training=self.training)
+        return prediction, hidden, cell
+
+class Seq2Seq(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=1):
+        super(Seq2Seq, self).__init__()
+        self.encoder = Encoder(input_dim, hidden_dim, num_layers)
+        self.decoder = Decoder(output_dim, hidden_dim, num_layers)
+
+    def forward(self, x):
+        hidden, cell = self.encoder(x)
+        output, hidden, cell = self.decoder(x, hidden, cell)
+        return output
+    
