@@ -54,7 +54,9 @@ class MBHT(SequentialRecommender):
         self.item_embedding = nn.Embedding(self.n_items + 1, self.hidden_size, padding_idx=0)  # mask token add 1
         self.position_embedding = nn.Embedding(self.max_seq_length + 1, self.hidden_size)  # add mask_token at the last
 
-        self.en_model = Seq2Seq(input_dim=64, hidden_dim=self.hidden_size, output_dim=64, num_layers=1)
+        self.enable_en = config['enable_en']
+        if self.enable_en:
+            self.en_model = Seq2Seq(input_dim=64, hidden_dim=self.hidden_size, output_dim=64, num_layers=1)
 
         if self.enable_ms:
             self.trm_encoder = TransformerEncoder(
@@ -384,9 +386,11 @@ class MBHT(SequentialRecommender):
         # [B mask_len max_len] * [B max_len H] -> [B mask_len H]
         # only calculate loss for masked position
 
-        seq_output_ed = self.en_model(seq_output)
-        seq_output_ed = torch.bmm(pred_index_map, seq_output_ed) 
-        seq_output = torch.bmm(pred_index_map, seq_output)  # [B mask_len H]
+        if self.enable_en:
+            seq_output_ed = self.en_model(seq_output)
+            seq_output_ed = torch.bmm(pred_index_map, seq_output_ed) 
+        else:
+            seq_output = torch.bmm(pred_index_map, seq_output)  # [B mask_len H]
 
         loss_fct = nn.CrossEntropyLoss(reduction='none')
         test_item_emb = self.item_embedding.weight  # [item_num H]
@@ -397,18 +401,20 @@ class MBHT(SequentialRecommender):
                 / torch.sum(targets)
         
         #pos_items.size()=torch.Size([64, 40])
+        if self.enable_en:
+            logits_2 = torch.matmul(seq_output_ed, test_item_emb.transpose(0, 1)) 
+            loss_2 = torch.sum(loss_fct(logits_2.view(-1, test_item_emb.size(0)), pos_items.view(-1)) * targets) \
+                    / torch.sum(targets)
+            
+            # output_distribution = F.log_softmax(seq_output_ed, dim=-1)
+            # target_distribution = F.softmax(pos_items.view(-1), dim=-1)
+            # kl_loss = F.kl_div(output_distribution, pos_items, reduction='batchmean')
+            # kl_loss =  torch.sum(F.kl_div(output_distribution, pos_items.view(-1), reduction='batchmean')* targets) \
+            #         / torch.sum(targets)
 
-        logits_2 = torch.matmul(seq_output_ed, test_item_emb.transpose(0, 1)) 
-        loss_2 = torch.sum(loss_fct(logits_2.view(-1, test_item_emb.size(0)), pos_items.view(-1)) * targets) \
-                / torch.sum(targets)
-        
-        # output_distribution = F.log_softmax(seq_output_ed, dim=-1)
-        # target_distribution = F.softmax(pos_items.view(-1), dim=-1)
-        # kl_loss = F.kl_div(output_distribution, pos_items, reduction='batchmean')
-        # kl_loss =  torch.sum(F.kl_div(output_distribution, pos_items.view(-1), reduction='batchmean')* targets) \
-        #         / torch.sum(targets)
-
-        total_loss = 0.8 * loss + 0.2 * loss_2
+            total_loss = 0.8 * loss + 0.2 * loss_2
+        else:
+            total_loss = loss
         return total_loss
 
     def full_sort_predict(self, interaction):
