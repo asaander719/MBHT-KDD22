@@ -389,32 +389,27 @@ class MBHT(SequentialRecommender):
         if self.enable_en:
             seq_output_ed = self.en_model(seq_output)
             seq_output_ed = torch.bmm(pred_index_map, seq_output_ed) 
-        else:
-            seq_output = torch.bmm(pred_index_map, seq_output)  # [B mask_len H]
+        
+        seq_output = torch.bmm(pred_index_map, seq_output)  # [B mask_len H]
 
         loss_fct = nn.CrossEntropyLoss(reduction='none')
         test_item_emb = self.item_embedding.weight  # [item_num H]
-        logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))  # [B mask_len item_num]
         targets = (masked_index > 0).float().view(-1)  # [B*mask_len]
 
+        logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))  # [B mask_len item_num]
         loss = torch.sum(loss_fct(logits.view(-1, test_item_emb.size(0)), pos_items.view(-1)) * targets) \
-                / torch.sum(targets)
+            / torch.sum(targets)
+       
         
-        #pos_items.size()=torch.Size([64, 40])
         if self.enable_en:
             logits_2 = torch.matmul(seq_output_ed, test_item_emb.transpose(0, 1)) 
             loss_2 = torch.sum(loss_fct(logits_2.view(-1, test_item_emb.size(0)), pos_items.view(-1)) * targets) \
                     / torch.sum(targets)
-            
-            # output_distribution = F.log_softmax(seq_output_ed, dim=-1)
-            # target_distribution = F.softmax(pos_items.view(-1), dim=-1)
-            # kl_loss = F.kl_div(output_distribution, pos_items, reduction='batchmean')
-            # kl_loss =  torch.sum(F.kl_div(output_distribution, pos_items.view(-1), reduction='batchmean')* targets) \
-            #         / torch.sum(targets)
-
             total_loss = 0.8 * loss + 0.2 * loss_2
+            # total_loss = loss_2
         else:
             total_loss = loss
+      
         return total_loss
 
     def full_sort_predict(self, interaction):
@@ -423,6 +418,8 @@ class MBHT(SequentialRecommender):
         item_seq_len = torch.count_nonzero(item_seq, 1)
         item_seq, type_seq = self.reconstruct_test_data(item_seq, item_seq_len, type_seq)
         seq_output = self.forward(item_seq, type_seq)
+        if self.enable_en:
+            seq_output = self.en_model(seq_output)
         seq_output = self.gather_indexes(seq_output, item_seq_len)  # [B H]
         test_items_emb = self.item_embedding.weight[:self.n_items]  # delete masked token
         scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, item_num]
@@ -454,6 +451,8 @@ class MBHT(SequentialRecommender):
         item_seq_len = torch.count_nonzero(item_seq, 1)
         item_seq, type_seq = self.reconstruct_test_data(item_seq, item_seq_len, type_seq)
         seq_output = self.forward(item_seq, type_seq)
+        if self.enable_en:
+            seq_output = self.en_model(seq_output)
         seq_output = self.gather_indexes(seq_output, item_seq_len)  # [B H]
         test_items_emb = self.item_embedding(candidates)  # delete masked token
         scores = torch.bmm(test_items_emb, seq_output.unsqueeze(-1)).squeeze()  # [B, item_num]
@@ -547,6 +546,7 @@ class Decoder(nn.Module):
     def __init__(self, output_dim, hidden_dim, num_layers=1, dropout=0.3):
         super(Decoder, self).__init__()
         self.rnn = nn.LSTM(output_dim, hidden_dim, num_layers, batch_first=True)
+        # batch_first=True:ontaining the features of the input sequence. The input can be a packed variable length sequence
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.dropout = dropout
 

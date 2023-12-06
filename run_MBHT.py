@@ -19,6 +19,7 @@ def get_args():
     parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--enable_hg', type=int, default=1)
     parser.add_argument('--enable_ms', type=int, default=1)
+    parser.add_argument('--enable_en', type=int, default=1)
     parser.add_argument('--customized_eval', type=int, default=1)
     return parser.parse_known_args()[0]
 
